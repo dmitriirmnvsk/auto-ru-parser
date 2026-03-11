@@ -2,6 +2,7 @@
 
 import random
 import time
+import re
 
 from bs4 import BeautifulSoup
 from requests import Response, get
@@ -16,62 +17,61 @@ from settings import app_settings
 from src import strings
 from src.schemas import Car
 
-TIME_TO_ENTER_CAPCHA = 25
+TIME_TO_ENTER_CAPCHA = 3
 
 
 def get_pages_amount(content: bytes) -> int:
-    """Calculate number of pages."""
-    soup = BeautifulSoup(content, "html.parser")
-    target_data = soup.find(strings.SPAN_TAG, class_=strings.TARGET_CLASS)
+    """Calculate number of pages from pagination links."""
+    html_text = content.decode("utf-8", errors="ignore")
+    soup = BeautifulSoup(html_text, "html.parser")
 
-    if not target_data:
-        return 0
+    page_links = soup.find_all("a", href=True)
+    max_page = 1
 
-    return len(target_data.contents)
+    for link in page_links:
+        href = link.get("href", "")
+        if "/cars/all/engine-electro/" not in href:
+            continue
+
+        match = re.search(r"[?&]page=(\d+)", href)
+        if match:
+            page_num = int(match.group(1))
+            if page_num > max_page:
+                max_page = page_num
+
+    print(f"Определено страниц в пагинации: {max_page}")
+    return max_page
 
 
 def parse_content(*, content: bytes) -> list[Car]:
     """Parsing page content."""
     cars: list[Car] = []
 
-    soup = BeautifulSoup(content, "html.parser")
-    items = soup.find_all(strings.DIV_TAG, class_="ListingItem__description")
+    html_text = content.decode("utf-8", errors="ignore")
+    soup = BeautifulSoup(html_text, "html.parser")
 
-    for item in items:
-        car_data = ""
-        if car_content := item.find(strings.DIV_TAG, strings.ITEM_SUMMARY):
-            car_data = car_content.get_text()
+    links = soup.find_all("a", href=True)
 
-        url = item.find(strings.A_TAG, strings.ITEM_TITLE_LINK).get(
-            strings.HREF_TAG, ""
-        )
+    seen = set()
 
-        car_price = 0
-        if price_content := item.find(strings.DIV_TAG, strings.ITEM_PRICE_CONTENT):
-            raw_price = price_content.get_text()
-            price_data = raw_price.replace(strings.NBSP_CODE, "").split(strings.RUR)
-            if len(price_data):
-                try:
-                    car_price = int(price_data[0])
-                except ValueError:
-                    car_price = 0
-
-        prod_year = 0
-        if year_data := item.find(strings.DIV_TAG, strings.ITEM_YEAR):
-            try:
-                prod_year = int(year_data.get_text())
-            except ValueError:
-                prod_year = 0
+    for link in links:
+        href = link.get("href", "").strip()
+        if "/cars/used/sale/" not in href:
+            continue
+        if href in seen:
+            continue
+        seen.add(href)
 
         cars.append(
             Car(
-                description=car_data,
-                url=url,
-                price=car_price,
-                year=prod_year,
+                description="",
+                url=href,
+                price=0,
+                year=0,
             )
         )
 
+    print(f"Уникальных ссылок на объявления на странице: {len(cars)}")
     return cars
 
 
@@ -83,10 +83,12 @@ def get_html(url: str, headers: dict, params: dict | None = None) -> Response:
         raise ConnectionError(f"При выполнении запроса произошла ошибка: {error}")
 
 
-def get_html_with_selenium(url: str, params: dict | None = None) -> str | None:
+def get_html_with_selenium(url: str) -> tuple[str | None, str | None]:
     """Get HTML content using Selenium for better anti-bot protection bypass."""
     service = Service()
     options = Options()
+
+    options.add_argument(r"--user-data-dir=C:\temp\auto_ru_selenium_profile")
 
     if app_settings.USE_SELENIUM_IN_BACKGROUND:
         options.add_argument("--headless")
@@ -105,37 +107,59 @@ def get_html_with_selenium(url: str, params: dict | None = None) -> str | None:
 
     try:
         full_url = url
-        if params:
-            full_url += "?" if "?" not in full_url else "&"
-            full_url += "&".join([f"{k}={v}" for k, v in params.items()])
-
         driver.get(full_url)
 
         if app_settings.COOKIE:
             for cookie_str in app_settings.COOKIE.split(";"):
                 if "=" in cookie_str:
                     name, value = cookie_str.strip().split("=", 1)
-                    driver.add_cookie(
-                        {"name": name, "value": value, "domain": ".auto.ru"}
-                    )
+                    try:
+                        driver.add_cookie(
+                            {"name": name, "value": value, "domain": ".auto.ru"}
+                        )
+                    except Exception:
+                        pass
+
+            driver.get(full_url)
+
+        print("Requested URL:", full_url)
+        print("Actual URL:", driver.current_url)
 
         time.sleep(TIME_TO_ENTER_CAPCHA)
 
-        WebDriverWait(driver, 10).until(
+        WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.TAG_NAME, "body"))
         )
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
 
-        time.sleep(random.uniform(1, 3))
+        time.sleep(5)
 
-        return driver.page_source
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.3);")
+        time.sleep(2)
+
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.6);")
+        time.sleep(2)
+
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.9);")
+        time.sleep(2)
+
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(4)
+
+        print("Final URL:", driver.current_url)
+        print("Page title:", driver.title)
+        print("Page height:", driver.execute_script("return document.body.scrollHeight"))
+
+        return driver.page_source, driver.current_url
 
     except Exception as exc:
         print(f"Ошибка при использовании Selenium: {exc}")
-        return None
+        return None, None
 
     finally:
-        driver.quit()
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
 
 def parse_response(url: str) -> list[Car] | None:
@@ -181,39 +205,46 @@ def simple_parse_response(url: str) -> list[Car] | None:
 
 
 def parse_response_with_selenium(url: str) -> list[Car] | None:
-    html_content = get_html_with_selenium(url)
-
-    if not html_content:
-        print("Не удалось получить содержимое страницы.")
-        return None
-
-    if "captcha" in html_content.lower():
-        print("Снова капча! 🤬")
-        return None
-
-    html_bytes = html_content.encode("utf-8")
-
     cars: list[Car] = []
-    pages_amount = get_pages_amount(html_bytes)
+    seen_urls = set()
 
-    if pages_amount == 0:
-        print(
-            "Не удалось определить количество страниц. \n"
-            "Возможно, структура сайта изменилась."
-        )
+    print(f"\nПарсим страницу 1: {url}")
+    first_page_html, first_final_url = get_html_with_selenium(url)
+
+    if not first_page_html:
+        print("Не удалось получить первую страницу")
         return None
 
-    cars.extend(parse_content(content=html_bytes))
+    if "captcha" in first_page_html.lower():
+        print("Обнаружена капча на первой странице!")
+        return None
+
+    first_page_bytes = first_page_html.encode("utf-8")
+    pages_amount = get_pages_amount(first_page_bytes)
+
+    first_page_cars = parse_content(content=first_page_bytes)
+    new_count = 0
+    for car in first_page_cars:
+        if car.url not in seen_urls:
+            seen_urls.add(car.url)
+            cars.append(car)
+            new_count += 1
+
+    print(f"Новых объявлений на странице 1: {new_count}")
+    print(f"Всего уникальных объявлений собрано: {len(cars)}")
+
+    if not first_final_url:
+        print("Не удалось определить финальный URL первой страницы")
+        return cars if cars else None
+
+    base_url = first_final_url.split("?")[0]
+    print(f"Базовый URL для пагинации: {base_url}")
 
     for page in range(2, pages_amount + 1):
-        print(f"Парсим {page} страницу из {pages_amount}...")
+        page_url = f"{base_url}?page={page}"
+        print(f"\nПарсим страницу {page}: {page_url}")
 
-        # Добавляем случайную задержку между запросами для имитации поведения человека
-        sleep_time = random.uniform(3, 7)
-        print(f"Ожидание {sleep_time:.2f} секунд перед следующим запросом...")
-        time.sleep(sleep_time)
-
-        page_html = get_html_with_selenium(url, params={"page": page})
+        page_html, final_url = get_html_with_selenium(page_url)
 
         if not page_html:
             print(f"Не удалось получить страницу {page}")
@@ -224,6 +255,23 @@ def parse_response_with_selenium(url: str) -> list[Car] | None:
             continue
 
         page_html_bytes = page_html.encode("utf-8")
-        cars.extend(parse_content(content=page_html_bytes))
+        page_cars = parse_content(content=page_html_bytes)
 
-    return cars
+        new_count = 0
+        for car in page_cars:
+            if car.url not in seen_urls:
+                seen_urls.add(car.url)
+                cars.append(car)
+                new_count += 1
+
+        print(f"Новых объявлений на странице {page}: {new_count}")
+        print(f"Всего уникальных объявлений собрано: {len(cars)}")
+
+        if final_url:
+            print(f"Финальный URL страницы {page}: {final_url}")
+
+        sleep_time = random.uniform(3, 7)
+        print(f"Ожидание {sleep_time:.2f} секунд перед следующим запросом...")
+        time.sleep(sleep_time)
+
+    return cars if cars else None
