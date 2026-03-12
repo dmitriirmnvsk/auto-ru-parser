@@ -78,6 +78,16 @@ def extract_brand(driver: webdriver.Chrome) -> str:
     return ""
 
 
+def extract_region(driver: webdriver.Chrome) -> str:
+    try:
+        return driver.find_element(
+            By.CSS_SELECTOR,
+            "span.MetroListPlace__regionName"
+        ).text.replace("\xa0", " ").strip()
+    except Exception:
+        return ""
+
+
 def extract_ownership_info(driver: webdriver.Chrome) -> dict[str, str]:
     data = {}
 
@@ -195,10 +205,12 @@ def parse_one_offer(driver: webdriver.Chrome, url: str) -> dict[str, str]:
     title = safe_find_text(driver, By.CSS_SELECTOR, "h1.CardHead__title")
     price = extract_price(driver)
     brand = extract_brand(driver)
+    region = extract_region(driver)
 
     row = {
         "url": url,
         "brand": brand,
+        "region": region,
         "title": title,
         "price": price,
     }
@@ -250,7 +262,7 @@ def save_to_csv(rows: list[dict[str, str]], path: Path = OUTPUT_FILE) -> None:
     for row in rows:
         all_fields.update(row.keys())
 
-    preferred = ["url", "brand", "title", "price"]
+    preferred = ["url", "brand", "region", "title", "price"]
     other_fields = sorted([f for f in all_fields if f not in preferred])
     fieldnames = preferred + other_fields
 

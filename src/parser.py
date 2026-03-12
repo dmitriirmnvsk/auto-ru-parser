@@ -14,7 +14,6 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from settings import app_settings
-from src import strings
 from src.schemas import Car
 
 TIME_TO_ENTER_CAPCHA = 3
@@ -51,7 +50,6 @@ def parse_content(*, content: bytes) -> list[Car]:
     soup = BeautifulSoup(html_text, "html.parser")
 
     links = soup.find_all("a", href=True)
-
     seen = set()
 
     for link in links:
@@ -83,8 +81,8 @@ def get_html(url: str, headers: dict, params: dict | None = None) -> Response:
         raise ConnectionError(f"При выполнении запроса произошла ошибка: {error}")
 
 
-def get_html_with_selenium(url: str) -> tuple[str | None, str | None]:
-    """Get HTML content using Selenium for better anti-bot protection bypass."""
+def get_driver() -> webdriver.Chrome:
+    """Create Selenium driver once for the whole parsing session."""
     service = Service()
     options = Options()
 
@@ -105,11 +103,20 @@ def get_html_with_selenium(url: str) -> tuple[str | None, str | None]:
         "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
     )
 
-    try:
-        full_url = url
-        driver.get(full_url)
+    return driver
 
-        if app_settings.COOKIE:
+
+def load_page_with_selenium(
+    driver: webdriver.Chrome,
+    url: str,
+    *,
+    add_cookies: bool = False,
+) -> tuple[str | None, str | None]:
+    """Load page using already created Selenium driver."""
+    try:
+        driver.get(url)
+
+        if add_cookies and app_settings.COOKIE:
             for cookie_str in app_settings.COOKIE.split(";"):
                 if "=" in cookie_str:
                     name, value = cookie_str.strip().split("=", 1)
@@ -120,9 +127,9 @@ def get_html_with_selenium(url: str) -> tuple[str | None, str | None]:
                     except Exception:
                         pass
 
-            driver.get(full_url)
+            driver.get(url)
 
-        print("Requested URL:", full_url)
+        print("Requested URL:", url)
         print("Actual URL:", driver.current_url)
 
         time.sleep(TIME_TO_ENTER_CAPCHA)
@@ -131,19 +138,19 @@ def get_html_with_selenium(url: str) -> tuple[str | None, str | None]:
             EC.presence_of_element_located((By.TAG_NAME, "body"))
         )
 
-        time.sleep(5)
+        time.sleep(3)
 
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.3);")
-        time.sleep(2)
+        time.sleep(1)
 
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.6);")
-        time.sleep(2)
+        time.sleep(1)
 
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.9);")
-        time.sleep(2)
+        time.sleep(1)
 
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(4)
+        time.sleep(2)
 
         print("Final URL:", driver.current_url)
         print("Page title:", driver.title)
@@ -155,11 +162,130 @@ def get_html_with_selenium(url: str) -> tuple[str | None, str | None]:
         print(f"Ошибка при использовании Selenium: {exc}")
         return None, None
 
-    finally:
+
+def get_current_page_source(driver: webdriver.Chrome) -> tuple[str | None, str | None]:
+    """Возвращает текущий HTML уже открытой страницы без повторного driver.get()."""
+    try:
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+        time.sleep(2)
+
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.3);")
+        time.sleep(1)
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.6);")
+        time.sleep(1)
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.9);")
+        time.sleep(1)
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(2)
+
+        print("Final URL:", driver.current_url)
+        print("Page title:", driver.title)
+        print("Page height:", driver.execute_script("return document.body.scrollHeight"))
+
+        return driver.page_source, driver.current_url
+    except Exception as exc:
+        print(f"Не удалось получить текущую страницу: {exc}")
+        return None, None
+
+
+def set_russia_region_if_needed(driver: webdriver.Chrome) -> None:
+    """После редиректа в регион пытается сбросить гео до всей РФ."""
+    wait = WebDriverWait(driver, 20)
+
+    try:
+        geo_title = wait.until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "div.GeoSelect__title-wkExE")
+            )
+        )
+
+        geo_text = geo_title.text.replace("\xa0", " ").strip()
+        print(f"Текущий гео-фильтр: {geo_text}")
+
+        if "Москва" not in geo_text:
+            print("Регион уже не Москва, ничего менять не нужно.")
+            return
+
+        # открыть гео-попап
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});",
+            geo_title
+        )
+        time.sleep(1)
+
         try:
-            driver.quit()
+            geo_title.click()
         except Exception:
-            pass
+            driver.execute_script("arguments[0].click();", geo_title)
+
+        print("Клик по гео выполнен")
+
+        # кнопка региона "Москва"
+        region_btn = wait.until(
+            EC.element_to_be_clickable(
+                (By.CSS_SELECTOR, "button.GeoSelectPopupRegion")
+            )
+        )
+
+        print("Кнопка региона найдена:", region_btn.text.replace("\xa0", " ").strip())
+
+        try:
+            region_btn.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", region_btn)
+
+        print("Регион Москва снят")
+        time.sleep(1.5)
+
+        # кнопка "Сохранить" — точный селектор под твой HTML
+        save_btn = wait.until(
+            EC.element_to_be_clickable(
+                (
+                    By.XPATH,
+                    "//button[contains(@class, 'Button_width_full')]"
+                    "[.//span[contains(@class, 'Button__text') and normalize-space()='Сохранить']]"
+                )
+            )
+        )
+
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});",
+            save_btn
+        )
+        time.sleep(0.5)
+
+        try:
+            save_btn.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", save_btn)
+
+        print("Кнопка 'Сохранить' нажата")
+
+        # ждём применения
+        time.sleep(4)
+
+        # обновляем страницу
+        driver.refresh()
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+        time.sleep(3)
+
+        try:
+            geo_title_after = wait.until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "div.GeoSelect__title-wkExE")
+                )
+            )
+            geo_text_after = geo_title_after.text.replace("\xa0", " ").strip()
+            print(f"Гео после сохранения: {geo_text_after}")
+        except Exception:
+            print("Не удалось прочитать гео после сохранения")
+
+    except Exception as exc:
+        print(f"Не удалось переключить регион на всю РФ: {exc}")
 
 
 def parse_response(url: str) -> list[Car] | None:
@@ -175,7 +301,6 @@ def parse_response(url: str) -> list[Car] | None:
         return None
 
     print(f"Получены данные по {len(cars)} авто.")
-
     return sorted(cars, key=lambda car: int(car.price), reverse=True)
 
 
@@ -208,70 +333,97 @@ def parse_response_with_selenium(url: str) -> list[Car] | None:
     cars: list[Car] = []
     seen_urls = set()
 
-    print(f"\nПарсим страницу 1: {url}")
-    first_page_html, first_final_url = get_html_with_selenium(url)
+    driver = get_driver()
 
-    if not first_page_html:
-        print("Не удалось получить первую страницу")
-        return None
+    try:
+        print(f"\nПарсим страницу 1: {url}")
+        first_page_html, first_final_url = load_page_with_selenium(
+            driver,
+            url,
+            add_cookies=True,
+        )
 
-    if "captcha" in first_page_html.lower():
-        print("Обнаружена капча на первой странице!")
-        return None
+        if not first_page_html:
+            print("Не удалось получить первую страницу")
+            return None
 
-    first_page_bytes = first_page_html.encode("utf-8")
-    pages_amount = get_pages_amount(first_page_bytes)
+        if "captcha" in first_page_html.lower():
+            print("Обнаружена капча на первой странице!")
+            return None
 
-    first_page_cars = parse_content(content=first_page_bytes)
-    new_count = 0
-    for car in first_page_cars:
-        if car.url not in seen_urls:
-            seen_urls.add(car.url)
-            cars.append(car)
-            new_count += 1
+        # один раз пытаемся сбросить гео до всей РФ
+        set_russia_region_if_needed(driver)
 
-    print(f"Новых объявлений на странице 1: {new_count}")
-    print(f"Всего уникальных объявлений собрано: {len(cars)}")
+        # ВАЖНО: не открываем url заново, а забираем уже текущую страницу после refresh
+        first_page_html, first_final_url = get_current_page_source(driver)
 
-    if not first_final_url:
-        print("Не удалось определить финальный URL первой страницы")
-        return cars if cars else None
+        if not first_page_html:
+            print("Не удалось получить первую страницу после смены региона")
+            return None
 
-    base_url = first_final_url.split("?")[0]
-    print(f"Базовый URL для пагинации: {base_url}")
+        if "captcha" in first_page_html.lower():
+            print("Обнаружена капча после смены региона!")
+            return None
 
-    for page in range(2, pages_amount + 1):
-        page_url = f"{base_url}?page={page}"
-        print(f"\nПарсим страницу {page}: {page_url}")
+        first_page_bytes = first_page_html.encode("utf-8")
+        pages_amount = get_pages_amount(first_page_bytes)
 
-        page_html, final_url = get_html_with_selenium(page_url)
-
-        if not page_html:
-            print(f"Не удалось получить страницу {page}")
-            continue
-
-        if "captcha" in page_html.lower():
-            print(f"Обнаружена капча на странице {page}! Пропускаем...")
-            continue
-
-        page_html_bytes = page_html.encode("utf-8")
-        page_cars = parse_content(content=page_html_bytes)
-
+        first_page_cars = parse_content(content=first_page_bytes)
         new_count = 0
-        for car in page_cars:
+        for car in first_page_cars:
             if car.url not in seen_urls:
                 seen_urls.add(car.url)
                 cars.append(car)
                 new_count += 1
 
-        print(f"Новых объявлений на странице {page}: {new_count}")
+        print(f"Новых объявлений на странице 1: {new_count}")
         print(f"Всего уникальных объявлений собрано: {len(cars)}")
 
-        if final_url:
-            print(f"Финальный URL страницы {page}: {final_url}")
+        if not first_final_url:
+            print("Не удалось определить финальный URL первой страницы")
+            return cars if cars else None
 
-        sleep_time = random.uniform(3, 7)
-        print(f"Ожидание {sleep_time:.2f} секунд перед следующим запросом...")
-        time.sleep(sleep_time)
+        base_url = first_final_url.split("?")[0]
+        print(f"Базовый URL для пагинации: {base_url}")
 
-    return cars if cars else None
+        for page in range(2, pages_amount + 1):
+            page_url = f"{base_url}?page={page}"
+            print(f"\nПарсим страницу {page}: {page_url}")
+
+            page_html, final_url = load_page_with_selenium(driver, page_url)
+
+            if not page_html:
+                print(f"Не удалось получить страницу {page}")
+                continue
+
+            if "captcha" in page_html.lower():
+                print(f"Обнаружена капча на странице {page}! Пропускаем...")
+                continue
+
+            page_html_bytes = page_html.encode("utf-8")
+            page_cars = parse_content(content=page_html_bytes)
+
+            new_count = 0
+            for car in page_cars:
+                if car.url not in seen_urls:
+                    seen_urls.add(car.url)
+                    cars.append(car)
+                    new_count += 1
+
+            print(f"Новых объявлений на странице {page}: {new_count}")
+            print(f"Всего уникальных объявлений собрано: {len(cars)}")
+
+            if final_url:
+                print(f"Финальный URL страницы {page}: {final_url}")
+
+            sleep_time = random.uniform(3, 7)
+            print(f"Ожидание {sleep_time:.2f} секунд перед следующим запросом...")
+            time.sleep(sleep_time)
+
+        return cars if cars else None
+
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
